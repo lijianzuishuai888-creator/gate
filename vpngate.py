@@ -36,16 +36,20 @@ for _stream in (sys.stdout, sys.stderr):
 # ---------------------------------------------------------------------------
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 
-VPNGATE_API = os.environ.get("VPNGATE_API", "http://www.vpngate.net/api/iphone/")
+VPNGATE_API = os.environ.get("VPNGATE_API", "https://www.vpngate.net/api/iphone/")
 VPNGATE_MIRROR = os.environ.get(
     "VPNGATE_MIRROR",
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://你的域名/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
-CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
+CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "45"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
-HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "45"))
+STABILITY_ROUNDS = max(1, int(os.environ.get("STABILITY_ROUNDS", "2")))
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3500"))
+MIN_STABILITY_SUCCESS = float(os.environ.get("MIN_STABILITY_SUCCESS", "0.5"))
+MAX_OUTPUT_NODES = int(os.environ.get("MAX_OUTPUT_NODES", "0"))
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -81,16 +85,8 @@ COUNTRY_ZH = {
 }
 
 # 静态优选域名池
-EDGE_HOSTS = [
-    h.strip()
-    for h in os.environ.get(
-        "EDGE_HOSTS",
-        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
-        "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
-    ).split(",")
-    if h.strip()
-]
+# 只使用明确属于你自己部署/已验证的入口，不再默认混入 bilibili、shopify 等普通网站。
+EDGE_HOSTS = [h.strip() for h in os.environ.get("EDGE_HOSTS", "").split(",") if h.strip()]
 
 # 优选 API 地址配置 (支持逗号分隔多个，可配置在 GitHub Action Secret / Env 中)
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=6&port=443")
@@ -250,10 +246,42 @@ def fetch_optimal_api_endpoints(api_urls_str):
             log("OPTIMAL API", f"拉取优选 API 失败 ({url}): {e}")
     return endpoints
 
+def get_sni_host():
+    from urllib.parse import urlparse
+    try:
+        return urlparse(WORKER_CHECK_URL).hostname or ""
+    except Exception:
+        return ""
+
+def validate_edge_hosts(candidates):
+    """用自己的 Worker/Pages 域名做 SNI，验证入口 TCP+TLS。"""
+    import socket, ssl
+    sni = get_sni_host()
+    if not candidates or not sni:
+        return candidates
+    def one(endpoint):
+        endpoint = endpoint.split("#",1)[0].strip()
+        if ":" not in endpoint: endpoint += ":443"
+        host, port = endpoint.rsplit(":",1)
+        try:
+            t0=time.perf_counter()
+            with socket.create_connection((host,int(port)), timeout=8) as sock:
+                ctx=ssl.create_default_context()
+                with ctx.wrap_socket(sock, server_hostname=sni):
+                    return endpoint, (time.perf_counter()-t0)*1000
+        except Exception:
+            return None
+    good=[]
+    with ThreadPoolExecutor(max_workers=min(16,len(candidates))) as pool:
+        for f in as_completed([pool.submit(one,e) for e in candidates]):
+            r=f.result()
+            if r: good.append(r)
+    good.sort(key=lambda x:x[1])
+    log("EDGE POOL", f"入口 TLS 验证通过: {len(good)}/{len(candidates)}")
+    return [e for e,_ in good]
+
 def get_combined_edge_hosts():
-    """
-    合并静态优选域名与优选 API 端点
-    """
+    """合并入口并做实际 TCP/TLS 验证。"""
     # 1. 优先读取 HOSTS_ENTRY 或 EDGE_HOSTS
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     static_hosts = [e.strip() for e in _entry.split(",") if e.strip()] if _entry else EDGE_HOSTS
@@ -270,7 +298,7 @@ def get_combined_edge_hosts():
             combined.append(h)
 
     log("EDGE POOL", f"汇总入口地址池: 静态域名 {len(static_hosts)} 个, API 获取 {len(api_hosts)} 个, 合并有效入口共 {len(combined)} 个")
-    return combined if combined else EDGE_HOSTS
+    return validate_edge_hosts(combined)
 
 # ---------------------------------------------------------------------------
 # 筛选 SSTP 节点
@@ -370,18 +398,38 @@ def check_one(node, session):
         return out
 
 def check_all(nodes, session):
-    results = []
+    results=[]
     with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
-        futures = [pool.submit(check_one, n, session) for n in nodes]
-        for fut in as_completed(futures):
-            results.append(fut.result())
+        futures=[pool.submit(check_one,n,session) for n in nodes]
+        for fut in as_completed(futures): results.append(fut.result())
+    passed=[r for r in results if r.get("success")]
+    if STABILITY_ROUNDS>1 and passed:
+        log("QUALITY", f"对 {len(passed)} 个首轮通过节点做稳定性复测")
+        for r in passed:
+            samples=[r.get("latency_ms")] if r.get("latency_ms") is not None else []
+            ok=1
+            for _ in range(STABILITY_ROUNDS-1):
+                q=check_one(r,session)
+                if q.get("success"):
+                    ok+=1
+                    if q.get("latency_ms") is not None: samples.append(q["latency_ms"])
+            r["stability_success"]=round(ok/STABILITY_ROUNDS,3)
+            r["latency_avg_ms"]=round(sum(samples)/len(samples),1) if samples else None
+            avg=r["latency_avg_ms"] or 5000
+            r["quality_score"]=round(r["stability_success"]*80+max(0,1-min(avg,5000)/5000)*20,2)
     return results
+
+def select_quality_nodes(results):
+    out=[r for r in results if r.get("success") and r.get("stability_success",1)>=MIN_STABILITY_SUCCESS and (r.get("latency_avg_ms") is None or r.get("latency_avg_ms")<=MAX_LATENCY_MS)]
+    out.sort(key=lambda r:(-(r.get("quality_score") or 0), r.get("latency_avg_ms") or 999999))
+    return out[:MAX_OUTPUT_NODES] if MAX_OUTPUT_NODES>0 else out
+
 
 # ---------------------------------------------------------------------------
 # 生成数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+    available = select_quality_nodes(results)
     countries = {}
     for n in available:
         c = n["country"] or "未知"
@@ -510,6 +558,8 @@ def main():
 
     # 动态拉取 API 并与静态优选域名混合
     edge_hosts = get_combined_edge_hosts()
+    if not edge_hosts:
+        die("没有任何入口通过 TCP/TLS 验证，拒绝生成可能失效的 nodes.txt")
 
     data_path, html_path, nodes_path = write_outputs(data, edge_hosts)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
